@@ -15,6 +15,8 @@ from shapely import geometry, ops
 from shapely.geometry import Point, Polygon
 from pyproj import Proj
 import utm
+from matplotlib.pyplot import cm
+import wntr.network.controls as controls
 
 
 class RandomWaterDistributionNetwork:
@@ -27,7 +29,8 @@ class RandomWaterDistributionNetwork:
 
         gmap_key(str): key for google maps API for downloading the elevation values for the nodes
 
-        world_cities(pd.DataFrame): pandas DataFrame from the free csv file in: https://simplemaps.com/data/world-cities
+        world_cities(pd.DataFrame): pandas DataFrame from the free csv file in: https://simplemaps.com/data/world-cities , it is used for
+        extracting the coordinates of the cities.
 
         min_population(int): the minimal population for the cities to be used for the generation of the Virtual Water Network
 
@@ -38,8 +41,6 @@ class RandomWaterDistributionNetwork:
         roughness_values(list): is a list of roughness values that will be assigned randomly to pipes
 
         reservoir_heads(list): is a list of heads that will be assigned randomly to the reservoirs 
-
-        number_of_reservoirs(int)
 
         pipe_diameters(list): list of possible diameters of pipes in the networks (in m)
         '''
@@ -52,44 +53,46 @@ class RandomWaterDistributionNetwork:
         self.roughness_values = roughness_values
         self.reservoir_heads = reservoir_heads
         self.pipes_diameters = pipes_diameters
+        self.sf = sf
         # A list to strore problematic pipes (pipes where the start node is also the end node)
         self.problematic_pipes = []
         self.number_of_reservoirs = 2
-        self.main_valves=[]
+        self.main_valves={}
         self.main_pipes=[]
         self.graph = None
         self.subgraph = None
         self.random_point = (32.933699, -5.666542)
-        self.nodes = []
         self.center = None
         self.out_points = None
         self.highest = None
         self.highest_node = None
         self.velocity = None
         self.pressure = None
+        self.valves_per_sect = {}
         # self.j = j
+
 
     def generate_random_graph(self):
         '''
-        Returns a random graph using the osmnx module
+        Returns a random networkx graph using the osmnx module
         '''
         big_cities = self.world_cities[self.world_cities.population > self.min_population].reset_index().drop(columns=['index'])
         random_index = random.randint(0, len(big_cities))
-
         random_city_coord = (big_cities.loc[random_index, 'lat'], big_cities.loc[random_index, 'lng'])
-
         # random_city_coord = (big_cities.loc[self.j, 'lat'], big_cities.loc[self.j, 'lng'])
-
         r1 = random.randint(-100, 100)/5000
         r2 = random.randint(-100, 100)/5000
         self.random_point = (random_city_coord[0]+r1, random_city_coord[1]+r2)
-
         return ox.graph_from_point(self.random_point, distance=self.distance, network_type='drive')
 
 
-    def proj_distance(self, y1, x1, y2, x2):
-        a = (y1-y2)**2 + (x1-x2)**2
+    def proj_distance(self, y1, x1, y2, x2, z1=0, z2=0):
+        '''
+        Methode for calculating distance from projected coordinates
+        '''
+        a = (y1-y2)**2 + (x1-x2)**2 + (z1-z2)**2
         return(math.sqrt(a))
+
 
     # Find the lists of clusters which are within tolerance distance from each other
     def tooclose(self, G, node, tolerance):
@@ -104,28 +107,29 @@ class RandomWaterDistributionNetwork:
                 x2 = G.nodes[u]['x']
                 y2 = G.nodes[u]['y']
                 if self.proj_distance(y1, x1, y2, x2) <= tolerance:
-                    cluster.append(u) 
-            
+                    cluster.append(u)             
             cluster.remove(node)
             cluster.append(node)
         return cluster
+
 
     def clean_graph(self, G, tol, partial=False): 
         '''
         Merges the clustered nodes that are less than tol apart 
         and deletes self loops and parallel edges from the input graph
+        partial(bool): True if used for cleaning the main network subgraph,
+        in this case the graph also is cleaned to be compatible with the subgraph
         '''      
-        # print('1')
         # Merge clustered nodes
         counter = 0            
         all_cluster = []
-        nodes_list = list(G.nodes)
+        nodes_list = G.nodes()
         k = 1
         iteration = 0
         while k>0 and iteration < 10:
             k=0
             iteration += 1
-            if partial: nodes_list = [u for u in list(self.subgraph.nodes) if not '{}'.format(u).startswith('R')]
+            if partial: nodes_list = [u for u in self.subgraph.nodes() if not '{}'.format(u).startswith('R')]
             for n in nodes_list:
                 previous_nodes = [y for x in all_cluster for y in x]
                 if n not in previous_nodes:
@@ -139,10 +143,8 @@ class RandomWaterDistributionNetwork:
                                 if G.has_node(x):
                                     G = nx.contracted_nodes(G, cluster[len(cluster)-1], x, self_loops=False)
                                     counter +=1
-                                    previous_nodes.append(x)
-        
+                                    previous_nodes.append(x)        
         nodes_to_remove = []
-        # print('2')
         # Remove parallel edges and self loops:
         edges_set = list(G.edges())
         for (u, v) in edges_set:
@@ -158,7 +160,7 @@ class RandomWaterDistributionNetwork:
                     G.remove_edge(u, v)
             while G.number_of_edges(u, v)>1:
                 G.remove_edge(u, v)
-        # print('3')
+        # Delete small cycles
         for u in G.nodes():
             for v in list(G.neighbors(u)):
                 for n in list(G.neighbors(u)):
@@ -168,14 +170,13 @@ class RandomWaterDistributionNetwork:
                         nodes_to_remove.append(n)
         for n in set(nodes_to_remove):
             G.remove_node(n)
-        # print('4')
         G = self.main_connected(G)
         return G
 
 
     def clean_cycles(self, G):
         '''
-        Cleans the input graph G from:
+        Cleans the input graph G from double lines, in these steps:
         1- small cycles where the nodes are aligned
         2- parallel edges and self loops
         3- small cycles that are inside bigger cycles
@@ -205,8 +206,7 @@ class RandomWaterDistributionNetwork:
                             if 0 < k < len(nodes_in_way)-1:
                                 nnext = int(list(nodes_in_way)[k+1])
                                 G.add_edge(current, nnext)
-                                G[current][nnext]['length'] = list(nodes_in_way.values())[k+1]-list(nodes_in_way.values())[k]
-        
+                                G[current][nnext]['length'] = list(nodes_in_way.values())[k+1]-list(nodes_in_way.values())[k]        
         # 2- remove parallel edges and self loops
         nodes_to_remove = []
         for u in G.nodes():
@@ -218,7 +218,6 @@ class RandomWaterDistributionNetwork:
                         nodes_to_remove.append(n)
         for n in nodes_to_remove:
             G.remove_node(n)
-
         # 3- clean small cycles that are inside bigger cycles  
         # nodes_inside = []
         # for cycle in list(nx.algorithms.simple_cycles(G.to_directed())):
@@ -232,11 +231,9 @@ class RandomWaterDistributionNetwork:
 
         # G.remove_nodes_from(nodes_inside)
             # print(cycle) 
-
         # To insure returning a connected graph
         G = self.main_connected(G)     
         return G
-
 
 
     def zone_position(self, G, zone):
@@ -264,24 +261,21 @@ class RandomWaterDistributionNetwork:
         elif (zone_center[1] > center[1] and abs(zone_center[0]-center[0]) > self.distance/2):
             return 'north east'
     
-    
-    
+        
     def find_points(self, G, zone, sizing = True):
         '''
         Generates a list of points for the zone depending oh it's position relative to the center
         of the graph G
-        Sizing = True if we are trying to figure out the sizes of the zones (not trying to get a random point)
+        Sizing = True if we are trying to figure out the sizes of the zones (not trying to find extremity points
+        depending on the position of the zone)
         '''         
         zone_center = zone['center']
         dx = zone['dx']
         dy = zone['dy']
         points = []
-        # print(zone_center)
-        # print(self.center)
         if sizing == True:
             for node in list(G.nodes):
-                if (zone_center[0]-dx <= G.nodes[node]['x'] <= zone_center[0]+dx and zone_center[1]-dy <= G.nodes[node]['y'] <= zone_center[1]+dy): points.append(node)
-        
+                if (zone_center[0]-dx <= G.nodes[node]['x'] <= zone_center[0]+dx and zone_center[1]-dy <= G.nodes[node]['y'] <= zone_center[1]+dy): points.append(node)        
         else:
             position = self.zone_position(G, zone)
             if position == 'middle':
@@ -315,6 +309,9 @@ class RandomWaterDistributionNetwork:
 
 
     def graph_center(self, projected_G):
+        '''
+        Methode for finding the coordinates of the center of the graph
+        '''
         x, y = 0, 0
         for node in projected_G.nodes():
             x += projected_G.nodes[node]['x']
@@ -357,8 +354,7 @@ class RandomWaterDistributionNetwork:
                 down_right, out_zones['down_right'] = zone_center, zone
             # the left
             if zone_center[0] <= down_left[0] and zone_center[1] <= down_left[1]:
-                down_left, out_zones['down_left'] = zone_center, zone                    
-    
+                down_left, out_zones['down_left'] = zone_center, zone                        
         return out_zones
 
 
@@ -375,7 +371,9 @@ class RandomWaterDistributionNetwork:
         axis = 'x'
         biggest = '0'
         z = 0
-        if Reservoirs== False: min_npoints = min([int(len(G)/8), min_npoints])
+        if Reservoirs== False: 
+            min_npoints = min([int(len(G)/8), min_npoints])
+            # min_npoints = len(G)/5
         while (npoints >= min_npoints):
             # print('npoints {}' .format(npoints))
             del zones[biggest]
@@ -400,16 +398,14 @@ class RandomWaterDistributionNetwork:
                 zones['{}'.format(z)] = zone1
                 zones['{}'.format(z+1)] = zone2
                 z += 2
-                axis = 'x'
-            
+                axis = 'x'            
             current = zones[list(zones)[0]]
             npoints = len(current['points'])
             center = current['center']
             dx = current['dx']
             dy = current['dy']
             axis = current['axis']
-            biggest = list(zones)[0]            
-            
+            biggest = list(zones)[0]                        
             for zone in zones:
                 if len(zones[zone]['points']) > npoints:
                     npoints = len(zones[zone]['points'])
@@ -419,6 +415,7 @@ class RandomWaterDistributionNetwork:
                     axis = zones[zone]['axis']
                     biggest = zone
         return zones
+
 
     def main_connected(self, G):
         cur_graph = G # whatever graph you're working with
@@ -434,11 +431,9 @@ class RandomWaterDistributionNetwork:
         else: return G
 
 
-    def highway(self, G, u, v):
-        return G.get_edge_data(u, v)['highway']
-
     def direction(self, ux, uy, vx, vy):
         return {'ex': vx-ux, 'ey': vy-uy}
+
 
     def in_way(self, G, u, v, cluster):
         nodes_in_way = {}
@@ -580,32 +575,6 @@ class RandomWaterDistributionNetwork:
         return subG
 
 
-    def generate_main_distr(self, G):
-        '''
-        For generating the main distribution system
-        '''
-        edges_list = [(u,v) for u,v in G.edges() if self.highway(G, u, v) == 'primary' or self.highway(G, u, v) == 'secondary' or self.highway(G, u, v) == 'tertiary' or self.highway(G, u, v) == 'trunk'] 
-        ec = ['r' if (self.highway(G, u, v) == 'primary' or self.highway(G, u, v) == 'secondary' or self.highway(G, u, v) == 'tertiary' or self.highway(G, u, v) == 'trunk') else 'grey' for u,v in G.edges()]
-
-
-        if len(edges_list)/len(list(G.edges())) > 0.25:
-            edges_list = [(u,v) for u,v in G.edges() if self.highway(G, u, v) == 'primary']
-            ec = ['r' if self.highway(G, u, v) == 'primary' else 'grey' for u,v in G.edges()]
-
-            if len(edges_list)/len(list(G.edges())) < 0.1:
-                edges_list = [(u,v) for u,v in G.edges() if self.highway(G, u, v) == 'primary' or self.highway(G, u, v) == 'secondary' or self.highway(G, u, v) == 'tertiary']    
-                ec = ['r' if (self.highway(G, u, v) == 'primary' or self.highway(G, u, v) == 'secondary' or self.highway(G, u, v) == 'tertiary') else 'grey' for u,v in G.edges()]
-        
-                if len(edges_list)/len(list(G.edges())) > 0.25:
-                    edges_list = [(u,v) for u,v in G.edges() if self.highway(G, u, v) == 'primary' or self.highway(G, u, v) == 'secondary']
-                    ec = ['r' if (self.highway(G, u, v) == 'primary' or self.highway(G, u, v) == 'secondary') else 'grey' for u,v in G.edges()]
-
-        print(len(edges_list)/len(list(G.edges())))
-        subG = nx.Graph(G).edge_subgraph(edges_list).copy()
-        self.graph = nx.Graph(G)
-        
-        return subG
-
     def add_elevation(self, G):
         '''
         Add elevation attribute to the nodes of the input graph
@@ -617,10 +586,10 @@ class RandomWaterDistributionNetwork:
             if G.nodes[node]['elevation'] > self.highest : 
                 self.highest = G.nodes[node]['elevation']
                 self.highest_node = node
+        self.graph = G.copy() 
 
 
-
-    def add_node_demands(self, G, area = 0.2):
+    def add_node_demands(self, G, area=0.2):
         '''
         Add demand attribute to the nodes of the input graph. The graph is divided to communities and each community is assigned a demand value randomly from demand_values
 
@@ -631,19 +600,15 @@ class RandomWaterDistributionNetwork:
         n_communities = round(n_nodes/4)
         community_generator = community.asyn_fluidc(G_copy, n_communities)
         demands = {}
-
         # Converting demand values to peak demands in m3/s
         demand_values = {key: 4*area*0.00379*v/(3600*24) for key,v in self.demand_values.items()}           
-
         for i in range(n_communities):
             # Construct a dictionary of demands for each community
             # (community nodes are the keys and demand values are the values)
             demands_list = list(demand_values.values())
             demands.update(dict.fromkeys(next(community_generator), {'demand' : demands_list[i%len(demand_values)]}))
-
         # Add the demand as attributes to the nodes in the graph
         nx.set_node_attributes(G, demands)
-        self.graph = G.copy() 
 
 
     def add_edge_roughness(self, G):
@@ -651,6 +616,43 @@ class RandomWaterDistributionNetwork:
         Adds the roughness as attribute to the edges in the graph
         '''
         nx.set_edge_attributes(G, random.choice(self.roughness_values), 'roughness') 
+
+
+    def reservoir_zone(self, G, local_highest, head):
+        reservoir = G.nodes[local_highest]
+        sf = self.sf
+        xr = reservoir['x']
+        yr = reservoir['y']
+        zr = reservoir['elevation']+head
+        reservoir_zone = []
+        for node in G.nodes():
+            x = G.nodes[node]['x']
+            y = G.nodes[node]['y']
+            z = G.nodes[node]['elevation']
+            l = self.proj_distance(y, x, yr, xr, z, zr)
+            if l*sf+20 < zr-z:
+                try:
+                    l = nx.algorithms.shortest_path_length(G, local_highest, node, 'length')
+                except Exception:
+                    continue
+            # Estimate pressure at node
+            p = zr-z-sf*l
+            if p > 20 :
+                reservoir_zone.append(node)
+            else :
+                continue
+        return reservoir_zone
+
+
+    def highest_elev(self, G):
+        highest_elevation = 0
+        for node in G.nodes():
+            z = G.nodes[node]['elevation']
+            if z > highest_elevation:
+                highest_elevation = z
+                highest_node = node
+        return highest_node
+
 
     def add_reservoirs(self, G):
         '''
@@ -722,6 +724,31 @@ class RandomWaterDistributionNetwork:
             return G
 
 
+    def connect_reservoirs(self, G, subG):
+        min_dist = self.distance
+        edges_list = []
+        for node in G.nodes():
+            if '{}'.format(node).startswith('R'):
+                xr = G.nodes[node]['x']
+                yr = G.nodes[node]['y']
+                zr = G.nodes[node]['z']
+                for n in subG.nodes():
+                    xn = subG.nodes[n]['x']
+                    yn = subG.nodes[n]['y']
+                    zn = subG.nodes[n]['elevation']
+                    dist = self.proj_distance(yn, xn, yr, xr, zn, zr)
+                    if dist < min_dist:
+                        min_dist = dist
+                        closest = n
+                path = nx.algorithms.shortest_path(G, node, closest,'length')
+                edges = [(path[j], path[j+1]) for j in range(len(path)-1)]
+                edges_list += edges
+
+        newG = G.edge_subgraph(edges_list)
+        subG = nx.compose(subG, newG)
+        return subG
+
+
     def create_wn(self, G, subG):
         '''
         Creates wntr.network.WaterNetworkModel from the graph G
@@ -730,30 +757,21 @@ class RandomWaterDistributionNetwork:
         G_junctions = G.copy()
         # Minimum spaning tree for the main pipes
         subT = nx.minimum_spanning_tree(subG)
-
         # main pipes diameters
         main_pipes = nlargest(3, self.pipes_diameters)
-
         for i in range(self.number_of_reservoirs):
             G_junctions.remove_node('Reservoir{}' .format(i))
-
         n_nodes = len(G_junctions)
         n_edges = G.number_of_edges()
-
         nodes_list = list(G_junctions.nodes(data=True))
         edges_list = list(G.edges(data=True))
-
         wn.add_pattern('pat1', [0.56, 0.37, 0.28, 0.33, 0.45, 0.67, 1.13, 2.02, 1.78, 1.6, 1.56, 1.45, 1.18, 1.19, 1.07, 0.97, 0.67, 0.9, 0.82, 1.22, 1.57, 1.3, 1.05, 0.92])
-
         for i in range(n_nodes):            
             node = nodes_list[i]
-            wn.add_junction('{}'.format(node[0]), base_demand=node[1]['demand'], elevation=node[1]['elevation'], coordinates=(node[1]['x'], node[1]['y']), demand_pattern_name='pat1')
-
-
+            wn.add_junction('{}'.format(node[0]), base_demand=node[1]['demand'], elevation=node[1]['elevation'], coordinates=(node[1]['x'], node[1]['y']), demand_pattern='pat1')
         for i in range(self.number_of_reservoirs):
             reservoir = G.nodes['Reservoir{}' .format(i)]
-            wn.add_reservoir('Reservoir{}' .format(i), base_head=reservoir['elevation'], coordinates=(reservoir['x'], reservoir['y']))
-        
+            wn.add_reservoir('Reservoir{}' .format(i), base_head=reservoir['elevation'], coordinates=(reservoir['x'], reservoir['y']))        
         connected_nodes = []
         for i in range(n_edges):
             edge = edges_list[i]
@@ -775,12 +793,9 @@ class RandomWaterDistributionNetwork:
                 minor_loss=0.0, status='OPEN')
                 connected_nodes.append('{}' .format(edge[0]))
                 connected_nodes.append('{}' .format(edge[1]))
-
-
         disconnected_nodes = set(wn.node_name_list)-set(connected_nodes)
         for i in disconnected_nodes:
-            wn.remove_node('{}'.format(i))
-            
+            wn.remove_node('{}'.format(i))            
         return wn
 
 
@@ -813,22 +828,11 @@ class RandomWaterDistributionNetwork:
         max_velocity = max(velocity)
         counter = 0
         starting_diam = self.pipes_diameters[0]
-        # while min_pressure < 0 :
-        #     print('stuck!')
-        #     starting_diam = bigger_diameter(starting_diam)
-        #     for link in pipes_list:
-        #         pipe = wn.get_link('{}'.format(link))
-        #         pipe.diameter = bigger_diameter(starting_diam)
-        #     sim = wntr.sim.EpanetSimulator(wn)
-        #     results = sim.run_sim()
-        #     pressure = results.node['pressure'].values[0][:-self.number_of_reservoirs].mean()
-        #     min_pressure = results.node['pressure'].values[0][:-self.number_of_reservoirs].min()
-        while counter < len(pipes_list) and max_velocity > 6:
+        while counter < 4*len(pipes_list) and max_velocity > 6:
             sim = wntr.sim.EpanetSimulator(wn)
             results = sim.run_sim()
             velocity = results.link['velocity'].values[0]
             max_velocity = max(velocity)
-            print(max_velocity)
             for link in pipes_list:
                 pipe = wn.get_link('{}'.format(link))
                 node1 = pipe.start_node_name
@@ -838,42 +842,75 @@ class RandomWaterDistributionNetwork:
                 pressure = (pressure1 + pressure2)/2
                 if pressure < min_pressure: min_pressure = pressure
                 if velocity[link] < 0.5 and pressure > 70:
-                    # print('1')
                     pipe.diameter = smaller_diameter(pipe.diameter)
                     counter += 1
-                if velocity[link] > 1.5 and pressure < 40:
-                    # print('2')
+                elif velocity[link] > 1.5 and pressure < 40:
                     pipe.diameter = bigger_diameter(pipe.diameter)
                     counter += 1
-                if velocity[link] > 2.5:
-                    print('3')
+                elif velocity[link] > 2.5:
                     pipe.diameter = bigger_diameter(pipe.diameter)
                     counter += 1
-                if velocity[link] < 0.01:
-                    print('4')
+                elif velocity[link] < 0.01:
                     pipe.diameter = smaller_diameter(pipe.diameter)
                     counter += 1
-                if pressure < 10:
-                    # print('5')
+                elif pressure < 10:
                     pipe.diameter = bigger_diameter(pipe.diameter)
                     counter += 1
-        
+                elif pressure > 100:
+                    pipe.diameter = smaller_diameter(pipe.diameter)
+                    counter += 1 
         self.velocity = results.link['velocity'].values[0]
-
         self.pressure = results.node['pressure'].values[0][:-self.number_of_reservoirs]
-
         return wn
 
-    def add_valves(self, wn, subG):
+
+    def add_valves(self, wn, subG, n_sectors):
         '''
         Divide the network to sectors using Louvain-Algorithm, and add valves between sectors. If plot_sect = 'True' it also plots the network with different colors for the sectors
         '''
         G = wn.get_graph()
-        # G = nx.Graph(G)
+        G = nx.Graph(G)
+        comm = community.asyn_fluidc(G, n_sectors)
+        connected_sect = {}
+        edges_bw_sect = {}
+        sectors = {}
+        k=0
+        while True:
+            try:
+                sectors['{}'.format(k)] = list(next(comm))
+                k+=1
+            except StopIteration:
+                break
+        
+        self.sectors = sectors
+        # Visualize the created communities
+        color = cm.rainbow(np.linspace(0,1,n_sectors))
+        nc = []        
+        for n in G.nodes():
+            for k in sectors:
+                if n in sectors[k]:
+                    nc.append(color[int(k)])
+        for sect1 in sectors:
+            self.valves_per_sect[sect1] = []
+            self.main_valves[sect1] = []
+            edges_bw_sect[sect1] = []
+            for sect2 in sectors:
+                if sect1 != sect2:
+                    connected_sect[sect1+'_'+sect2] = []
+        valves = []
+        # Find connection between sectors (one for each pair)
+        for (u,v) in list(G.edges()):
+            for sect1 in sectors:
+                if (u in sectors[sect1] and v not in sectors[sect1]) or (v in sectors[sect1] and u not in sectors[sect1]):
+                    edges_bw_sect[sect1].append((u,v))
+                    for sect2 in sectors:
+                        if sect2!=sect1:
+                            if v in sectors[sect2]:
+                                connected_sect[sect1+'_'+sect2].append(1)
+                                valves.append((u,v))
         counter = 0
         pipes = []
         pipes_list = set(range(wn.num_links))-set(self.problematic_pipes)
-        # print(G.nodes())
         for link in pipes_list:
             pipe = wn.get_link('{}'.format(link))
             node1 = pipe.start_node_name
@@ -883,12 +920,54 @@ class RandomWaterDistributionNetwork:
             if node2.startswith('R'): no2 = node2
             else: no2 = int(node2)
             diameter = pipe.diameter         
-            if subG.has_edge(no1, no2):
-                if len(list(subG.neighbors(no1))) > 2 or len(list(subG.neighbors(no2))) > 2:
-                    wn.add_valve('S{}'.format(counter), node1, node2, diameter, 'TCV', 0)
-                    self.main_valves.append(counter)
+            if (node1, node2) in valves:
+                for sect in sectors:
+                    if (node1, node2) in edges_bw_sect[sect]:
+                        wn.add_valve('S{}_{}'.format(sect, counter), node1, node2, diameter, 'TCV', 0)
+                        if subG.has_edge(no1, no2) or subG.has_edge(no2, no1):
+                            self.main_valves[sect].append('S{}_{}'.format(sect, counter))
+                        else:
+                            self.valves_per_sect[sect].append('S{}_{}'.format(sect, counter))
+                    elif (node2, node1) in edges_bw_sect[sect]:
+                        wn.add_valve('S{}_{}'.format(sect, counter), node1, node2, diameter, 'TCV', 0)
+                        if subG.has_edge(no1, no2) or subG.has_edge(no2, no1):
+                            self.main_valves[sect].append('S{}_{}'.format(sect, counter))
+                        else:
+                            self.valves_per_sect[sect].append('S{}_{}'.format(sect, counter))
             counter += 1
-
+        min_dist = self.distance
+        edges_list = []
+        for sect in sectors:
+            if len(self.main_valves[sect]) < 1:
+                edge_sect = random.choice(edges_bw_sect[sect])
+                node_sect = edge_sect[1]
+                xr = G.nodes[node_sect]['pos'][0]
+                yr = G.nodes[node_sect]['pos'][1]
+                closest = list(subG.nodes())[0]
+                for n in subG.nodes():
+                    xn = subG.nodes[n]['x']
+                    yn = subG.nodes[n]['y']
+                    dist = self.proj_distance(yn, xn, yr, xr)
+                    if dist < min_dist:
+                        min_dist = dist
+                        closest = n
+                path = nx.algorithms.shortest_path(G, node_sect, '{}'.format(closest),'length')
+                edges = [edge_sect]
+                edges += [(path[j], path[j+1]) for j in range(len(path)-1)]
+                edges_list += edges
+        for pipe_name, pipe in wn.pipes():
+            node1 = pipe.start_node_name
+            node2 = pipe.end_node_name
+            if (node1, node2) in edges_list or (node2, node1) in edges_list:
+                pipe.diameter = 0.6
+        for sect in self.valves_per_sect:
+            for valve_name in self.valves_per_sect[sect]:
+                valve = wn.get_link(valve_name)
+                node1 = valve.start_node_name
+                node2 = valve.end_node_name
+                if (node1, node2) in edges_list or (node2, node1) in edges_list:
+                    self.valves_per_sect[sect].remove(valve_name)
+                    self.main_valves[sect].append(valve_name)                 
         return wn
 
             
@@ -901,35 +980,30 @@ class RandomWaterDistributionNetwork:
             node = wn.get_node(node_name)
             # to convert to m3/h
             node.demand_timeseries_list[0].base_value = 0.25* node.base_demand *3600
-            node.pattern = 'pat1'
-
+            # node.demand_pattern= 'pat1'
+        for sect in self.valves_per_sect:
+            for valve_name in self.valves_per_sect[sect]:
+                valve = wn.get_link(valve_name)
+                act1 = controls.ControlAction(valve, 'status', 0)
+                print(act1)
         wn.write_inpfile(filename, units='CMH')
         return wn
+
 
     # @property
     def stats(self, wn):
         '''
         Calculates some stats of the network
         '''
-
-        # sim = wntr.sim.EpanetSimulator(wn)
-        # results = sim.run_sim()
         G = wn.get_graph()
         G = nx.Graph(G)
-
         degrees = nx.degree_histogram(G)
-
         # Number of nodes
         n_nodes = len(G)
-
         # Number of edges
         n_edges = G.size()
-
         # Total length of the network
         lengths = [pipe.length for pipe_name, pipe in wn.pipes()]
-
         # Pipe diameters
-        pipes_diameters = [pipe.diameter for pipe_name, pipe in wn.pipes()]
-        
-
-        return {'Number of nodes': n_nodes, 'Number of edges': n_edges, 'Number of reservoirs':self.number_of_reservoirs, 'Velocity' : self.velocity, 'Pressure' : self.pressure, 'Lengths': lengths, 'Diameters': pipes_diameters, 'Degrees': degrees, 'Main valves': self.main_valves}
+        pipes_diameters = [pipe.diameter for pipe_name, pipe in wn.pipes()]        
+        return {'Number of nodes': n_nodes, 'Number of edges': n_edges, 'Number of reservoirs':self.number_of_reservoirs, 'Velocity' : self.velocity, 'Pressure' : self.pressure, 'Lengths': lengths, 'Diameters': pipes_diameters, 'Degrees': degrees, 'Main valves': self.main_valves, 'Valves per sector': self.valves_per_sect}
