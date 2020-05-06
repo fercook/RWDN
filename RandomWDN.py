@@ -15,8 +15,7 @@ import math
 import wntr
 import csv
 
-# gmap_key = input("Enter gmap_key (Google maps API): \n")
-gmap_key = "Insert your Gmap key"
+gmap_key = input("Enter gmap_key (Google maps API): \n")
 
 # Creating the ouput directory
 output_dir = os.getcwd() + '/WDN_output'
@@ -24,7 +23,7 @@ output_dir = os.getcwd() + '/WDN_output'
 number_of_WDN = 100
 
 # Loading cities data from which the location of the streets will be generated
-world_cities = pd.read_csv(os.getcwd() + '/worldcities.csv')
+world_cities = pd.read_csv("/home/anas/Desktop/Thesis/simplemaps_worldcities_basicv1.6/worldcities.csv")
 
 # the minimal population for the cities to be used for the generation of the Virtual Water Network
 min_population = 100000
@@ -46,12 +45,13 @@ pipes_diameters = [0.04, 0.06, 0.08, 0.1, 0.13, 0.15, 0.18, 0.2, 0.3, 0.4, 0.5, 
 
 # pipes_diameters = [0.08, 0.1, 0.11, 0.13, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
 
+sf = 0.01
 
 j=0
 while j < number_of_WDN:
 # try:
-    # distance = random.randint(1000, 3000)
-    distance = 2000
+    distance = random.randint(1000, 3000)
+    # distance = 2000
 
     rd = RandomWaterDistributionNetwork(gmap_key, world_cities, min_population, distance, demand_values, roughness_values, reservoir_heads, pipes_diameters)
 
@@ -59,6 +59,7 @@ while j < number_of_WDN:
     while True:
         try:
             G = rd.generate_random_graph()
+            # Add elevation values to the nodes 
             rd.add_elevation(G)
             if len(G) < 200: 
                 print ('Number of nodes < 200, this graph will be discarded') 
@@ -67,7 +68,7 @@ while j < number_of_WDN:
         except Exception:
             continue
     print('Graph n: {} generated' .format(j))
-    # Add elevation values to the nodes 
+    # Project the layout UTM-WGS84
     G = ox.project_graph(G)
     print('Graph n: {} projected UTM-WGS84' .format(j))
     G = nx.Graph(G)
@@ -76,22 +77,21 @@ while j < number_of_WDN:
     G = rd.clean_graph(G, 15)
     print('Graph n: {} cleaned from too closely clustered nodes' .format(j))
 
-    # Add node demands 
+    # Add demands to nodes
     rd.add_node_demands(G)
     print('Demand values added to nodes' .format(j))
 
     # Create main distribution network
-    # subG = rd.generate_main_distr(G)
     subG = rd.main_network(G)
     subG = rd.clean_cycles(subG)
     print('Main distribution network created')
 
     # Add reservoirs as nodes and connecting them to the graph
     subG = rd.add_reservoirs(subG)
-    # print(len(subG))
+    subG = rd.connect_reservoirs(G, subG)
     print('Reservoirs added')
     F = nx.compose(G, subG)
-    # F = rd.clean_graph(F, 0)
+
     # Add edge roughness
     rd.add_edge_roughness(F)
     print('Roughness added to the Graph {}'.format(j))
@@ -104,10 +104,11 @@ while j < number_of_WDN:
     print('Pipe sizing performed')
 
     # Divide the network to sectors and add valves between sectors
-    wn = rd.add_valves(wn, subG)
+    wn = rd.add_valves(wn, subG, n_sectors=8)
     stats = rd.stats(wn)
     print('Valves have been added to the network')
-    
+
+    # If the minimum pressure is above zero save the network and the stats
     if min(stats['Pressure']) > 0:
         filename = os.path.join(output_dir, 'WDN{}' .format(j) + '.inp')
         rd.save_wn(wn, filename)
@@ -117,6 +118,12 @@ while j < number_of_WDN:
         print('Main valves list:')
         print(rd.main_valves)
         
+        closed_valves = pd.DataFrame(dict([ (k,pd.Series(v)) for k,v in stats['Valves per sector'].items() ]))
+        open_valves = pd.DataFrame(dict([ (k,pd.Series(v)) for k,v in stats['Main valves'].items() ]))
+        
+        closed_valves.to_csv(os.path.join(output_dir, 'valves_to_be_closed{}' .format(j) + '.csv'))
+        open_valves.to_csv(os.path.join(output_dir, 'main_valves{}' .format(j) + '.csv'))
+
         out = os.path.join(output_dir, 'stats/WDN_out{}' .format(j) + '.csv')
         w = csv.writer(open(out, "w"))
         for key, val in stats.items():
@@ -128,4 +135,3 @@ while j < number_of_WDN:
         continue
     # except Exception:
         # continue
-
